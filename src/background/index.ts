@@ -1,15 +1,15 @@
 /**
  * LeetCode Arena — background/index.ts
- * MV3 Service Worker — automatic contest detection & state sync.
+ * MV3 Service Worker — Hybrid automatic contest detection + LeetCode-only guards.
  *
- * Detection strategies (in priority order):
- *  1. chrome.webRequest.onCompleted  — POST to contest submit endpoints (primary)
- *  2. chrome.webNavigation.onCompleted — arrival at contest ranking pages (fallback)
+ * Detection strategies (priority order):
+ *  1. chrome.webRequest.onCompleted  — POST to any submit endpoint
+ *  2. chrome.webNavigation.onCompleted — arrival at contest ranking pages
  *  3. chrome.runtime.onMessage       — explicit signals from content/popup
+ *  4. chrome.commands.onCommand      — registered keyboard shortcut (Alt+A)
+ *  5. chrome.action.onClicked        — toolbar click when popup fails
  *
- * Storage format matches Zustand's persist middleware exactly:
- *   key: 'arena-user-storage'    → JSON string of { state: UserState,    version: 0 }
- *   key: 'arena-contest-storage' → JSON string of { state: ContestState, version: 0 }
+ * All UI-toggle paths (4 & 5) enforce: URL must be leetcode.com.
  */
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -75,7 +75,6 @@ function calculateLevel(xp: number): string {
   return 'Legendary';
 }
 
-/** Format "weekly-contest-412" → "Weekly Contest 412" */
 function formatContestName(slug: string): string {
   return slug.split('-').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
@@ -97,8 +96,8 @@ async function writeSlice<T>(key: string, slice: PersistedSlice<T>): Promise<voi
 // ─── Core handler ─────────────────────────────────────────────────────────────
 
 /**
- * Called whenever a contest-completion event is detected.
- * Idempotency-guarded: same-day completions are ignored.
+ * Single idempotency-guarded handler for all contest completion sources.
+ * Writes directly to chrome.storage.local in Zustand's persist format.
  */
 async function handleContestCompletion(
   contestName: string,
@@ -107,10 +106,10 @@ async function handleContestCompletion(
 ): Promise<void> {
   const today = new Date().toISOString().split('T')[0];
 
-  const userSlice    = await readSlice<UserState>(KEYS.user, DEFAULT_USER);
-  const u            = userSlice.state;
+  const userSlice = await readSlice<UserState>(KEYS.user, DEFAULT_USER);
+  const u = userSlice.state;
 
-  // Guard: already counted today
+  // Idempotency: never double-count the same day
   const done =
     u.streak.lastActiveDate === today &&
     (u.todayStatus === 'completed_live' || u.todayStatus === 'completed_virtual');
@@ -160,65 +159,84 @@ async function handleContestCompletion(
     },
   });
 
-  // Celebrate!
+  // Desktop notification
   const notifId = `arena-${Date.now()}`;
   chrome.notifications.create(notifId, {
     type:    'basic',
-    iconUrl: chrome.runtime.getURL('favicon.svg'),
-    title:   '🔥 Arena — Contest Complete!',
+    iconUrl: chrome.runtime.getURL('icon.png'),
+    title:   '🔥 Arena — Auto-detected!',
     message: `${contestName}  ✓  |  +${xpEarned} XP  ·  +${coinsEarned} 🪙  |  🔥 ${newCurrent}-day streak`,
     priority: 2,
   });
   setTimeout(() => chrome.notifications.clear(notifId), 8000);
 
-  console.log(`[Arena BG] "${contestName}" (${type}) done. Streak: ${newCurrent}`);
+  console.log(`[Arena BG] "${contestName}" (${type}) → Streak: ${newCurrent} | XP: ${newXp}`);
 }
 
-// ─── Listener 1: webRequest — contest submission POSTs (primary) ──────────────
+// ─── Listener 1: webRequest — broadened to ALL submission endpoints ───────────
 /**
- * LeetCode's contest submission endpoint:
- *   POST https://leetcode.com/contest/{name}/problems/{slug}/submit/
+ * Catches successful POST 200/201 responses on every LeetCode submit path:
  *
- * A 200 response means the submission was accepted by the server (i.e., the
- * user actively competed — the actual verdict doesn't matter for streak purposes).
+ *  • /problems/{slug}/submit/            → regular problem  → 'virtual'
+ *  • /contest/{name}/problems/{slug}/submit/ → contest submit  → 'live'
+ *  • /contest/api/{name}/*               → contest API      → 'live'
  *
- * Also watches the general /problems/ submit path for practice-mode sessions
- * under a virtual contest umbrella.
+ * The idempotency guard in handleContestCompletion ensures a single
+ * problem submission on a regular day doesn't spam the store.
  */
 chrome.webRequest.onCompleted.addListener(
   (details) => {
+    // Only POST submissions
     if (details.method !== 'POST') return;
-    if (details.statusCode !== 200) return;
+    // Accept 200 OR 201 (some endpoints return 201 Created)
+    if (details.statusCode !== 200 && details.statusCode !== 201) return;
 
-    // Contest submission: /contest/{name}/problems/{slug}/submit/
-    const contestMatch = details.url.match(
+    const url = details.url;
+
+    // Priority 1: Contest submission endpoint
+    const contestMatch = url.match(
       /leetcode\.com\/contest\/([^/?#]+)\/problems\/[^/?#]+\/submit/i
     );
     if (contestMatch) {
       const contestName = formatContestName(contestMatch[1]);
-      // Virtual contests typically have "virtual" in the URL or query string
-      const isVirtual = /virtual/i.test(details.url);
+      const isVirtual   = /virtual/i.test(url);
       void handleContestCompletion(contestName, isVirtual ? 'virtual' : 'live', 1);
+      return;
+    }
+
+    // Priority 2: Contest API endpoint
+    const contestApiMatch = url.match(/leetcode\.com\/contest\/api\/([^/?#]+)/i);
+    if (contestApiMatch) {
+      const contestName = formatContestName(contestApiMatch[1]);
+      void handleContestCompletion(contestName, 'live', 1);
+      return;
+    }
+
+    // Priority 3: Regular problem submission (counts as virtual / practice)
+    const regularMatch = url.match(/leetcode\.com\/problems\/([^/?#]+)\/submit/i);
+    if (regularMatch) {
+      // Format "two-sum" → "Two Sum" style name from slug
+      const problemName = formatContestName(regularMatch[1]);
+      void handleContestCompletion(problemName, 'virtual', 1);
     }
   },
   {
     urls: [
+      // Regular problem submissions
+      '*://leetcode.com/problems/*/submit/',
+      '*://leetcode.com/problems/*/submit',
+      // Contest problem submissions
       '*://leetcode.com/contest/*/problems/*/submit/',
       '*://leetcode.com/contest/*/problems/*/submit',
+      // Contest API endpoints
+      '*://leetcode.com/contest/api/*',
     ],
     types: ['xmlhttprequest'],
   }
 );
 
-// ─── Listener 2: webNavigation — contest ranking pages (fallback) ─────────────
-/**
- * Fires when the user navigates to a contest ranking/results page, which is a
- * reliable secondary signal for "the user finished a contest".
- *
- * Examples:
- *   https://leetcode.com/contest/weekly-contest-412/ranking/
- *   https://leetcode.com/contest/biweekly-contest-136/virtual/ranking/
- */
+// ─── Listener 2: webNavigation — contest ranking pages ────────────────────────
+
 chrome.webNavigation.onCompleted.addListener(
   (details) => {
     if (details.frameId !== 0) return;
@@ -239,7 +257,8 @@ chrome.webNavigation.onCompleted.addListener(
 
 // ─── Listener 3: runtime.onMessage — explicit signals ────────────────────────
 /**
- * Accepts manual signals from the content script or popup.
+ * Accepts signals from the content script's "Verify Today's Activity" flow
+ * (after the GraphQL check passes) and from any other extension page.
  *
  * Message: { type: 'ARENA_CONTEST_COMPLETE',
  *             payload: { contestName, contestType, solvedCount } }
@@ -253,7 +272,7 @@ chrome.runtime.onMessage.addListener(
 
     if (msg.type !== 'ARENA_CONTEST_COMPLETE') return false;
 
-    const { contestName = 'Contest', contestType = 'virtual', solvedCount = 0 } = msg.payload ?? {};
+    const { contestName = 'Contest', contestType = 'live', solvedCount = 0 } = msg.payload ?? {};
 
     void handleContestCompletion(
       contestName,
@@ -261,8 +280,79 @@ chrome.runtime.onMessage.addListener(
       solvedCount
     ).then(() => sendResponse({ success: true }));
 
-    return true; // Keep channel open for async response
+    return true;
   }
 );
 
-console.log('[Arena] Background service worker active.');
+console.log('[Arena] Background service worker active — hybrid tracking enabled.');
+
+// ─── URL guard helper ─────────────────────────────────────────────────────────
+
+/** Returns true only if the given URL belongs to leetcode.com (or a subdomain). */
+function isLeetCodeUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const { hostname } = new URL(url);
+    return hostname === 'leetcode.com' || hostname.endsWith('.leetcode.com');
+  } catch {
+    return false;
+  }
+}
+
+/** Show a short "Arena only works on LeetCode" notification. */
+function notifyWrongSite() {
+  const id = `arena-wrong-site-${Date.now()}`;
+  chrome.notifications.create(id, {
+    type:    'basic',
+    iconUrl: chrome.runtime.getURL('icon.png'),
+    title:   'LeetCode Arena',
+    message: 'Arena only works on leetcode.com. Navigate there first!',
+    priority: 1,
+  });
+  setTimeout(() => chrome.notifications.clear(id), 4000);
+}
+
+/** Forward an OPEN_ARENA message to the specified tab. */
+async function sendOpenArena(tabId: number): Promise<void> {
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'OPEN_ARENA' });
+  } catch {
+    // Content script not yet ready — tab will handle Alt+A natively
+  }
+}
+
+// ─── Listener 4: commands.onCommand — registered keyboard shortcut ────────────
+/**
+ * Handles the "toggle-arena" command (Alt+A) registered in the manifest.
+ * This fires from ANY Chrome tab, so we must enforce the LeetCode-only rule.
+ *
+ *  • Active tab is leetcode.com  → send OPEN_ARENA to the tab
+ *  • Active tab is anything else → show a notification and do nothing
+ */
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command !== 'toggle-arena') return;
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) return;
+
+  if (!isLeetCodeUrl(tab.url)) {
+    notifyWrongSite();
+    return;
+  }
+
+  await sendOpenArena(tab.id);
+});
+
+// ─── Listener 5: action.onClicked — toolbar icon (popup-less fallback) ────────
+/**
+ * Chrome fires action.onClicked only when NO default_popup is defined.
+ * We keep this as a defensive fallback in case the popup fails to load.
+ * Same LeetCode-only guard applies.
+ */
+chrome.action.onClicked.addListener(async (tab) => {
+  if (!isLeetCodeUrl(tab.url)) {
+    notifyWrongSite();
+    return;
+  }
+  if (tab.id != null) await sendOpenArena(tab.id);
+});

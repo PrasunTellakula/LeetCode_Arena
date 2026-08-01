@@ -13,13 +13,24 @@ export default defineManifest({
     "48":  "icon.png",
     "128": "icon.png"
   },
+  // Keyboard shortcut — users can reassign in chrome://extensions/shortcuts
+  commands: {
+    "toggle-arena": {
+      suggested_key: { default: "Alt+A" },
+      description: "Toggle the LeetCode Arena overlay"
+    }
+  },
   background: {
     service_worker: "src/background/index.ts",
     type: "module"
   },
   content_scripts: [
     {
-      matches: ["https://leetcode.com/*"],
+      // Strictly LeetCode only — no subdomains, no other sites
+      matches: [
+        "https://leetcode.com/*",
+        "https://*.leetcode.com/*"
+      ],
       js: ["src/content/index.tsx"],
       run_at: "document_idle"
     }
@@ -33,4 +44,5 @@ export default defineManifest({
       "128": "icon.png"
     }
   }
-})
+})
+
